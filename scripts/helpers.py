@@ -1,13 +1,39 @@
 import pandas as pd
 import numpy as np
 import pypsatopo
-import parameters as p
-import os
+from scripts.config import En_price_year, discount_rate, outputs_folder
+from scripts import parameters as p
 import matplotlib.pyplot as plt
-from scipy.stats import pearsonr
-from pathlib import Path
 import matplotlib as mpl
 from matplotlib.patches import Patch
+import pickle as pkl
+from scripts.solver_profiles import SOLVER_PROFILES
+import yaml
+from copy import deepcopy
+import inspect, datetime as dt
+import math
+from pathlib import Path
+import xarray as xr
+import os, json
+
+# -------NETWORK
+def build_snapshots(En_price_year):
+    start_day = str(En_price_year) + '-01-01'
+    start_date = start_day + 'T00:00'  # keep the format 'YYYY-MM-DDThh:mm' when selecting start and end time
+    end_day = str(En_price_year + 1) + '-01-01'
+    end_date = end_day + 'T00:00'  # excludes form the data set
+
+    hours_in_period = pd.date_range(start_date + 'Z', end_date + 'Z', freq='h')
+    hours_in_period = hours_in_period.drop(hours_in_period[-1])
+
+    # Check if it's a leap year
+    def is_leap_year(year):
+        return (year % 4 == 0 and (year % 100 != 0 or year % 400 == 0))
+
+    if is_leap_year(En_price_year):
+        # Remove all timestamps that fall on February 29
+        hours_in_period = hours_in_period[~((hours_in_period.month == 2) & (hours_in_period.day == 29))]
+    return hours_in_period, start_date, end_date
 
 # -------TECHNO-ECONOMIC DATA & ANNUITY
 def annuity(n, r):
@@ -19,16 +45,79 @@ def annuity(n, r):
     else:
         return 1 / n
 
-def prepare_costs(cost_file, USD_to_EUR, discount_rate, Nyears, lifetime):
+def dict_to_costs_df(tech_inputs: dict, target_columns=None) -> pd.DataFrame:
+    """
+    Convert a dict like:
+      {('technology','parameter'): {'value':..., 'unit':..., ...}, ...}
+    into a MultiIndex DataFrame with index names ['technology','parameter'].
+
+    Any missing target columns are added as NaN; extra keys are kept unless
+    target_columns is provided (then we align to that set).
+    """
+    # Build DF from the inner dicts
+    df_new = pd.DataFrame.from_dict(tech_inputs, orient='index')
+    # Ensure a proper MultiIndex with names
+    df_new.index = pd.MultiIndex.from_tuples(df_new.index, names=['technology', 'parameter'])
+
+    # If you want to align exactly to the destination schema:
+    if target_columns is not None:
+        # add any missing columns from target
+        for col in target_columns:
+            if col not in df_new.columns:
+                df_new[col] = np.nan
+        # drop extra columns not in target (comment this if you want to keep them)
+        df_new = df_new[target_columns]
+
+    return df_new
+
+
+def merge_into_costs(costs: pd.DataFrame, tech_inputs: dict, currency_year=None) -> pd.DataFrame:
+    """
+    Convert tech_inputs to DF and merge into 'costs':
+      - overwrite existing rows for same (technology, parameter)
+      - append brand new rows
+    Optionally set currency_year for all new/updated rows.
+    """
+    target_cols = list(costs.columns)  # ['value','unit','source','further description','currency_year']
+    df_new = dict_to_costs_df(tech_inputs, target_columns=target_cols)
+
+    if currency_year is not None:
+        df_new['currency_year'] = currency_year
+
+    costs_out = costs.copy()
+
+    # Append rows that are new (index not present in costs)
+    new_idx = df_new.index.difference(costs_out.index)
+    if len(new_idx) > 0:
+        costs_out = pd.concat([costs_out, df_new.loc[new_idx]], axis=0)
+
+    # Overwrite values for rows that already exist
+    costs_out.update(df_new)
+
+    # Ensure column order and types stay consistent
+    costs_out = costs_out[target_cols]
+
+    return costs_out
+
+def prepare_costs(cost_path : str, tech_inputs: dict, USD_to_EUR: float , discount_rate : float, Nyears: int = 1, lifetime: int = 25):
     """ This function uses, data retrived form the technology catalogue and other sources and compiles a DF used in the model
-    input: cost_file # csv
+    input:
+    - cost_file. as downloaded from technology-data repository
+    - tech_inputs. technical paramaters for various technolgies. usually stored in technology_inputs.py
+
     output: costs # DF with all cost used in the model"""
 
     # Nyear = nyear in the interval for myoptic optimization--> set to 1 for annual optimization
+
     # set all asset costs and other parameters
 
+    costs_from_technology_data = pd.read_csv(cost_path, index_col=[0, 1]).sort_index()
 
-    costs = pd.read_csv(cost_file, index_col=[0, 1]).sort_index()
+    # add extra technologies and parameters
+    if tech_inputs:
+        costs= merge_into_costs(costs_from_technology_data, tech_inputs, currency_year=None)
+    else:
+        costs = costs_from_technology_data
 
     # correct units to MW and EUR
     costs.loc[costs.unit.str.contains("/kW"), "value"] *= 1e3
@@ -49,7 +138,6 @@ def prepare_costs(cost_file, USD_to_EUR, discount_rate, Nyears, lifetime):
     costs["fixed"] = [annuity_factor(v) * v["investment"] * Nyears for i, v in costs.iterrows()]
     return costs
 
-
 def cost_add_technology(discount_rate, tech_costs, technology, investment, lifetime, FOM):
     '''function to calculate annualized fixed cost for any technology from inpits
     and adds it to the tech_costs dataframe '''
@@ -62,26 +150,144 @@ def cost_add_technology(discount_rate, tech_costs, technology, investment, lifet
 
 
 def add_technology_cost(tech_costs, other_tech_costs):
-    """Function that adds the tehcnology costs not presente din the original cost file"""
-
+    """Function that adds the tehcnology costs not present in the original cost file"""
     for idx in other_tech_costs.index.values:
         investment = other_tech_costs.at[idx, 'investment']
         FOM = other_tech_costs.at[idx, 'FOM']
         lifetime = other_tech_costs.at[idx, 'lifetime']
-        cost_add_technology(p.discount_rate, tech_costs, idx, investment, lifetime, FOM)
+        cost_add_technology(discount_rate, tech_costs, idx, investment, lifetime, FOM)
 
     return tech_costs
 
 
+
 # --- OPTIMIZATION-----
-def solve_network(net, solver="gurobi"):
-    """Create and solve the Linopy model using gurobi; fall back to HiGHS if needed."""
-    net.optimize.create_model()
+def _apply_common_overrides(solver, opts, threads=None, time_limit=None):
+    if threads is not None:
+        key = "Threads" if solver == "gurobi" else "threads"
+        opts[key] = int(threads)
+    if time_limit is not None:
+        key = "TimeLimit" if solver == "gurobi" else "time_limit"
+        opts[key] = float(time_limit)
+
+
+
+def solve_network(n, solver="gurobi", profile=None,
+                  io_api="direct", time_limit=None, threads=None,
+                  overrides=None, fallback_order=("highs",),
+                  assign_all_duals=True):
+    """
+    Solve with Gurobi or HiGHS using named profiles.
+    Returns: (status, condition, used_solver, used_options)
+    Also stamps objective/solver info into n.meta for persistence in NetCDF.
+    """
+    solver = solver.lower()
+    if profile is None:
+        profile = "gurobi-default" if solver == "gurobi" else "highs-default"
+
     try:
-        net.optimize.solve_model(solver_name=solver)
+        base = SOLVER_PROFILES[solver][profile]
+    except KeyError:
+        raise ValueError(f"Unknown profile '{profile}' for solver '{solver}'")
+
+    opts = deepcopy(base)
+    _apply_common_overrides(solver, opts, threads=threads, time_limit=time_limit)
+    if overrides:
+        opts.update(overrides)
+
+    n.optimize.create_model()
+
+    def _assign_duals(n):
+        if not assign_all_duals:
+            return
+        if hasattr(n.optimize, "assign_duals"):
+            try:
+                n.optimize.assign_duals(assign_all_duals=True)
+                return
+            except TypeError:
+                n.optimize.assign_duals()
+                return
+        if hasattr(n, "model") and hasattr(n.model, "assign_duals"):
+            n.model.assign_duals()
+            return
+        if hasattr(n.optimize, "read_solution"):
+            try:
+                n.optimize.read_solution(assign_all_duals=True)
+                return
+            except TypeError:
+                n.optimize.read_solution()
+                return
+
+    def _stamp_meta(n, status, condition, used_solver, used_opts):
+        # Safely fetch objective value if available
+        obj_val = float("nan")
+        try:
+            if hasattr(n, "model") and hasattr(n.model, "objective"):
+                # Linopy convention after solve: objective.value is a scalar
+                val = getattr(n.model.objective, "value", None)
+                if val is not None:
+                    obj_val = float(val)
+        except Exception:
+            pass
+
+        # Ensure meta exists and contains JSON-/YAML-friendly types
+        meta = dict(getattr(n, "meta", {}) or {})
+        # Convert any non-serializable solver options to strings
+        safe_opts = {}
+        for k, v in (used_opts or {}).items():
+            try:
+                _ = float(v) if isinstance(v, (int, float)) else v
+                safe_opts[k] = v
+            except Exception:
+                safe_opts[k] = str(v)
+
+        meta.update({
+            "objective": None if (obj_val is None or math.isnan(obj_val)) else float(obj_val),
+            "opt_status": str(status) if status is not None else None,
+            "opt_termination": str(condition) if condition is not None else None,
+            "opt_solver": used_solver,
+            "opt_options": safe_opts,
+        })
+        n.meta = meta  # assign back
+
+    # ---- primary attempt ----
+    try:
+        status, condition = n.optimize.solve_model(
+            solver_name=solver,
+            io_api=io_api,
+            **opts,
+        )
+        _assign_duals(n)
+        _stamp_meta(n, status, condition, solver, opts)
+        return status, condition, solver, opts
     except Exception as e:
-        print(f"[WARN] {solver} failed: {e}\nFalling back to HiGHS.")
-        net.optimize.solve_model(solver_name="highs")
+        print(f"[WARN] {solver} failed: {e}")
+
+    # ---- fallbacks ----
+    for fb in fallback_order:
+        fb = fb.lower()
+        if fb not in SOLVER_PROFILES:
+            continue
+        fb_profile = next(iter(SOLVER_PROFILES[fb].keys()))
+        fb_opts = deepcopy(SOLVER_PROFILES[fb][fb_profile])
+        _apply_common_overrides(fb, fb_opts, threads=threads, time_limit=time_limit)
+        try:
+            print(f"Falling back to {fb} …")
+            status, condition = n.optimize.solve_model(
+                solver_name=fb,
+                io_api=io_api,
+                **fb_opts,
+            )
+            _assign_duals(n)
+            _stamp_meta(n, status, condition, fb, fb_opts)
+            return status, condition, fb, fb_opts
+        except Exception as e2:
+            print(f"[WARN] {fb} fallback failed: {e2}")
+
+    # If we reach here, no solution; still stamp meta for traceability
+    _stamp_meta(n, status=None, condition="failed", used_solver=solver, used_opts=opts)
+    raise RuntimeError("All solver attempts failed.")
+
 
 def optimal_network_only(n_opt):
     """function that removes unused: buses, links, stores, generators, storage_units and loads,
@@ -113,24 +319,119 @@ def optimal_network_only(n_opt):
     return n
 
 
-def export_print_network(n, n_flags_opt, folder, file_name):
-    # Define file name
-    # export network and print layout using pypsatopo
-    file_name = file_name + '_OPT'
+def file_name_network(n, n_flags, run_name, inputs_dict):
+    """function that automatically creates a file name give a network"""
+    # the netwrok name includes: the agents included,  the demands variables H2_d, MeOH_d, CO2 cost, bioChar credits
+    # and max fraction of electricity sold externally
+    # example: Biogas_CHeat_RE_H2_MeOH_SymN_CO2c200_H2d297_MeOHd68
+    CO2_cost = inputs_dict['CO2 cost']
 
-    if n_flags_opt['print']:
-        n_plot = optimal_network_only(n)
-        filename = file_name + '_OPT.svg'
-        full_path = os.path.join(folder, filename)
-        pypsatopo.generate(n_plot, file_output=full_path, negative_efficiency=False, carrier_color=True)
-    if n_flags_opt['export']:
-        filename = file_name + '_OPT.nc'
-        full_path = os.path.join(folder, filename)
+    # loads
+    if 'H2 grid' in n.loads.index.values:
+        H2_d = int(n.loads_t.p_set['H2 grid'].sum() // 1000)  # yearly production of H2 in GWh
+    else:
+        H2_d = 0
+
+    if 'Methanol' in n.loads.index.values:
+        MeOH_d = int(n.loads_t.p_set['Methanol'].sum() // 1000)  # yearly production of MeOH in GWh
+    else:
+        MeOH_d = 0
+
+    if 'bioCH4' in n.loads.index.values:
+        bioCH4_d = int(n.loads_t.p_set['bioCH4'].sum() // 1000)  # yearly production of MeOH in GWh
+    else:
+        bioCH4_d = 0
+
+    # CO2 tax
+    CO2_c = int(CO2_cost)  # CO2 price in currency
+
+    # year
+    year = int(En_price_year)  # energy price year
+
+    # max El to DK1
+    el_DK1_sale_el_RFNBO = inputs_dict['el_DK1_sale_el_RFNBO']
+
+    # agents
+    file_name = n_flags['biogas'] * 'SB_' + n_flags['central_heat'] * 'CH_' + n_flags['renewables'] * 'RE_' + \
+                n_flags['electrolysis'] * 'H2_' + n_flags['meoh'] * 'meoh_' + n_flags['methanation'] * 'meth_' + n_flags['symbiosis'] * 'SN_' + \
+                n_flags['storage'] * 'ST_' + 'CO2c' + str(CO2_c) + '_' + 'H2d' + str(H2_d) + \
+                '_' + 'MeOHd' + str(MeOH_d) + '_' + 'CH4d' + str(bioCH4_d) + '_' + str(year) + '_' + 'ElDK1' + '_' + str(el_DK1_sale_el_RFNBO) + '_' + run_name
+
+    return file_name
+
+def create_results_folders (network_name):
+
+    # Create directories for saving files if not existing
+    results_folder = create_folder_if_not_exists(outputs_folder, network_name)
+    networks_folder = create_folder_if_not_exists(results_folder, 'networks')
+    plots_folder = create_folder_if_not_exists(results_folder, 'plots')
+
+    return networks_folder, plots_folder
+
+def save_config (results_folder,c):
+    # export configuration from config.py
+    networks_folder = create_folder_if_not_exists(results_folder, 'networks')
+    dump_params_module(c, dst_folder=networks_folder, filename="config_run.yaml",
+                       dataframes_as="records")
+
+import os
+
+def export_print_network(n, n_flags, network_name, results_folder, suffix):
+    networks_folder = create_folder_if_not_exists(results_folder, 'networks')
+
+    # choose the plotted network
+    n_plot = optimal_network_only(n) if suffix == '_OPT' else n
+
+    full_path = None
+
+    if n_flags.get('print'):
+        filename = f"{network_name}{suffix}.svg"
+        full_path = os.path.join(networks_folder, filename)
+        pypsatopo.generate(n_plot, file_output=full_path,
+                           negative_efficiency=False, carrier_color=True)
+
+    if n_flags.get('export'):
+        filename = f"{network_name}{suffix}.nc"
+        full_path = os.path.join(networks_folder, filename)
         n.export_to_netcdf(full_path)
+
+    if full_path is None:
+        return None
+
+    return full_path
+
+
+def patch_netcdf_attrs(nc_path: Path, **attrs):
+    # load -> update attrs -> write back atomically
+    ds = xr.load_dataset(nc_path)  # load to memory so we can overwrite the same path
+    # make options JSON-safe if you want to store them too
+    if "opt_options" in attrs and attrs["opt_options"] is not None:
+        try:
+            json.dumps(attrs["opt_options"])
+        except Exception:
+            attrs["opt_options"] = {k: str(v) for k, v in attrs["opt_options"].items()}
+
+    for k, v in attrs.items():
+        if v is not None:
+            ds.attrs[k] = v
+    tmp = nc_path.with_suffix(nc_path.suffix + ".tmp")
+    ds.to_netcdf(tmp)   # write new file
+    ds.close()
+    os.replace(tmp, nc_path)  # atomic replace on most OSes
+
+
+def save_network_comp_allocation (results_folder, network_comp_allocation):
+    # save allocation of compeonts to each agent/plant in pkl file
+
+    networks_folder = create_folder_if_not_exists(results_folder, 'networks')
+
+    networks_folder = Path(networks_folder)
+    with open(networks_folder / 'network_comp_allocation.pkl', 'wb') as f:
+        pkl.dump(network_comp_allocation, f)
+
     return
 
-
-# --- ANALAYSIS AND PLOT ----
+# --- ANALYSIS AND PLOT ----
 
 def build_electricity_grid_price_w_tariff(Elspotprices):
     """this function creates the Electricity grid price including the all the tariffs
@@ -146,8 +447,8 @@ def build_electricity_grid_price_w_tariff(Elspotprices):
     # peak tariff in winter + weekdays + 06:00 to 21.00
     # Low tariff the rest of the time
 
-    summer_start = str(p.En_price_year) + '-04-01T00:00'  # '2019-04-01 00:00:00+00:00' # Monday
-    summer_end = str(p.En_price_year) + '-10-01T00:00'  # '2019-10-01 00:00:00+00:00'
+    summer_start = str(En_price_year) + '-04-01T00:00'  # '2019-04-01 00:00:00+00:00' # Monday
+    summer_end = str(En_price_year) + '-10-01T00:00'  # '2019-10-01 00:00:00+00:00'
     winter_1 = pd.date_range(p.start_date + 'Z', summer_start + 'Z', freq='H')
     winter_1 = winter_1.drop(winter_1[-1])
     winter_2 = pd.date_range(summer_end + 'Z', p.end_date + 'Z', freq='H')
@@ -319,7 +620,7 @@ def get_total_marginal_capital_cost_agents(n_opt, network_comp_allocation, plot_
         bottom_neg = 0.0
 
         def stack_segment(value, facecolor, hatch=None):
-            nonlocal bottom_pos, bottom_neg   # <-- fix
+            nonlocal bottom_pos, bottom_neg
             if value == 0:
                 return
             if value >= 0:
@@ -367,15 +668,6 @@ def get_total_marginal_capital_cost_agents(n_opt, network_comp_allocation, plot_
     return cc_tot_agent, mc_tot_agent
 
 
-def reg_coef(x, y, label=None, color=None, hue=None, **kwargs):
-    ''' function that calculates the pearson correlation conefficient (r) for plotting in PairGrid'''
-    ax = plt.gca()
-    r, p = pearsonr(x, y)
-    ax.annotate('r = {:.2f}'.format(r), xy=(0.5, 0.5), xycoords='axes fraction', ha='center')
-    ax.set_axis_off()
-    return
-
-
 
 def create_folder_if_not_exists(path, folder_name):
     # general function for storing plots
@@ -387,3 +679,70 @@ def create_folder_if_not_exists(path, folder_name):
         print(f"Folder already exists: {folder_path}")
     return folder_path  # Return the full path of the folder
 
+
+def _to_basic(obj, dataframes_as="records"):
+    """Convert common scientific Python objects to YAML-safe Python types."""
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        return obj
+    if isinstance(obj, (np.integer,)):   return int(obj)
+    if isinstance(obj, (np.floating,)):  return float(obj)
+    if isinstance(obj, (np.bool_,)):     return bool(obj)
+    if isinstance(obj, (np.ndarray,)):   return obj.tolist()
+
+    if isinstance(obj, pd.DataFrame):
+        if dataframes_as == "records":
+            return obj.to_dict(orient="records")
+        if dataframes_as == "split":
+            return obj.to_dict(orient="split")  # {index, columns, data}
+        if dataframes_as == "columns":
+            return obj.to_dict(orient="list")   # {col: [..], ...}
+        if dataframes_as == "csv":
+            return obj.to_csv(index=False)
+        if dataframes_as == "summary":
+            return {"__type__": "DataFrame",
+                    "shape": list(obj.shape),
+                    "columns": obj.columns.tolist()}
+        return obj.to_dict(orient="records")
+
+    if isinstance(obj, (pd.Series, pd.Index)):
+        return obj.tolist()
+    if isinstance(obj, (pd.Timestamp, dt.datetime, dt.date)):
+        return obj.isoformat()
+    if isinstance(obj, Path):
+        return str(obj)
+
+    if isinstance(obj, dict):
+        return {k: _to_basic(v, dataframes_as) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_to_basic(v, dataframes_as) for v in obj]
+
+    # Fallback for anything else
+    return repr(obj)
+
+def _extract_public_values(module):
+    vals = {}
+    for k, v in vars(module).items():
+        if k.startswith("_"):                       # skip private/special
+            continue
+        if inspect.ismodule(v) or inspect.isfunction(v) or inspect.isclass(v):
+            continue                                # skip callables/classes/modules
+        vals[k] = v
+    return vals
+
+def dump_params_module(module, dst_folder, filename="params.yaml",
+                       dataframes_as="records", sort_keys=False):
+    """
+    Dump the public contents of `module` to YAML in `dst_folder/filename`.
+    dataframes_as: 'records' | 'split' | 'columns' | 'csv' | 'summary'
+    """
+    params = _extract_public_values(module)
+    clean = _to_basic(params, dataframes_as=dataframes_as)
+
+    dst = Path(dst_folder)
+    dst.mkdir(parents=True, exist_ok=True)
+    path = dst / filename
+
+    with path.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(clean, f, sort_keys=sort_keys, allow_unicode=True)
+
+    return path
